@@ -15,5 +15,6 @@
 
 pub mod constants;
 pub mod json;
+mod pool;
 pub mod transport;
 pub mod types;
