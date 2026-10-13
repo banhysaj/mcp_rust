@@ -1368,3 +1368,143 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
     }
     "unknown exception".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn strip_bom_and_trim_handles_bom_and_whitespace() {
+        assert_eq!(strip_bom_and_trim("  {\"a\":1}\r\n"), "{\"a\":1}");
+        assert_eq!(strip_bom_and_trim("\u{feff}{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(strip_bom_and_trim("   "), "");
+        assert_eq!(strip_bom_and_trim(""), "");
+        // a byte order mark only counts at the very start
+        assert_eq!(strip_bom_and_trim("a\u{feff}b"), "a\u{feff}b");
+    }
+
+    #[test]
+    fn log_ranks_are_ordered() {
+        assert!(log_rank("debug") < log_rank("info"));
+        assert!(log_rank("error") < log_rank("emergency"));
+        assert_eq!(log_rank("nonsense"), 1);
+    }
+
+    #[test]
+    fn cacheable_methods() {
+        assert!(is_cacheable_method(MTD_TOOLS_LIST));
+        assert!(is_cacheable_method(MTD_SERVER_DISCOVER));
+        assert!(!is_cacheable_method(MTD_TOOLS_CALL));
+        assert!(!is_cacheable_method(MTD_PING));
+    }
+
+    #[test]
+    fn argument_validation_messages() {
+        let tool = Tool::new("t", "d")
+            .add_parameter_simple("n", PropertyType::Integer, "iters")
+            .add_parameter(ToolParameter::new("s", PropertyType::String, "x").optional());
+        assert_eq!(
+            validate_tool_args(&tool, &json!({})).unwrap_err(),
+            "Missing required argument: n"
+        );
+        assert_eq!(
+            validate_tool_args(&tool, &json!({"n": "no"})).unwrap_err(),
+            "Argument 'n' should be of type integer"
+        );
+        assert!(validate_tool_args(&tool, &json!({"n": 3})).is_ok());
+        assert!(validate_tool_args(&tool, &json!({"n": 3, "s": "y"})).is_ok());
+        assert!(validate_tool_args(&tool, &json!({"n": 3, "s": 5})).is_err());
+    }
+
+    #[test]
+    fn generated_schema_shape() {
+        let t = Tool::new("crunch", "A long-running job")
+            .add_parameter_simple("n", PropertyType::Integer, "iterations")
+            .add_parameter(
+                ToolParameter::new("tags", PropertyType::Array, "").set_item_type("string"),
+            )
+            .add_enum_param("mode", ["fast", "slow"], "pick one");
+        let v = tool_value(&t);
+        assert_eq!(
+            json::serialize(&v),
+            r#"{"name":"crunch","description":"A long-running job","inputSchema":{"type":"object","properties":{"n":{"type":"integer","description":"iterations"},"tags":{"type":"array","items":{"type":"string"}},"mode":{"type":"string","description":"pick one","enum":["fast","slow"]}},"required":["n","tags","mode"]}}"#
+        );
+    }
+
+    #[test]
+    fn content_values_shape() {
+        assert_eq!(
+            json::serialize(&content_value(&Content::text("hi"))),
+            r#"{"type":"text","text":"hi"}"#
+        );
+        assert_eq!(
+            json::serialize(&content_value(&Content::image("AAA", "image/png"))),
+            r#"{"type":"image","data":"AAA","mimeType":"image/png"}"#
+        );
+        assert_eq!(
+            json::serialize(&content_value(&Content::embedded_blob(
+                "u",
+                "AAA",
+                "image/png"
+            ))),
+            r#"{"type":"resource","resource":{"uri":"u","mimeType":"image/png","blob":"AAA"}}"#
+        );
+        assert_eq!(
+            json::serialize(&content_value(&Content::embedded_text("u", "t", ""))),
+            r#"{"type":"resource","resource":{"uri":"u","text":"t"}}"#
+        );
+        assert_eq!(
+            json::serialize(&content_value(&Content::resource_link("u", "n", "", ""))),
+            r#"{"type":"resource_link","uri":"u","name":"n"}"#
+        );
+    }
+
+    #[test]
+    fn elicit_request_shape() {
+        let e = Elicitation::make_form("ask", "How many?").add_field(
+            "n",
+            PropertyType::Integer,
+            "iterations",
+        );
+        let v = elicit_request_value(&e).unwrap();
+        assert_eq!(
+            json::serialize(&v),
+            r#"{"method":"elicitation/create","params":{"mode":"form","message":"How many?","requestedSchema":{"type":"object","properties":{"n":{"type":"integer","description":"iterations"}},"required":["n"]}}}"#
+        );
+
+        let url = Elicitation::make_url("ask", "Go here", "https://example.com/x");
+        let v = elicit_request_value(&url).unwrap();
+        let s = json::serialize(&v);
+        assert!(s.contains(r#""mode":"url""#));
+        assert!(s.contains(r#""url":"https://example.com/x""#));
+        assert!(s.contains(r#""elicitationId":""#));
+
+        let bad = Elicitation::make_form("ask", "m").add_field("o", PropertyType::Object, "");
+        assert!(elicit_request_value(&bad).is_err());
+
+        let mut no_id = Elicitation::make_url("ask", "m", "https://example.com");
+        no_id.elicitation_id.clear();
+        assert!(elicit_request_value(&no_id).is_err());
+    }
+
+    #[test]
+    fn elicit_caps_detection() {
+        let empty = json!({});
+        let c = client_elicit_caps(&empty);
+        assert!(!c.form && !c.url);
+
+        let form_only = json!({"_meta":{"io.modelcontextprotocol/clientCapabilities":{"elicitation":{"form":{}}}}});
+        let c = client_elicit_caps(&form_only);
+        assert!(c.form && !c.url);
+
+        let bare =
+            json!({"_meta":{"io.modelcontextprotocol/clientCapabilities":{"elicitation":{}}}});
+        let c = client_elicit_caps(&bare);
+        assert!(c.form && !c.url);
+
+        let both = json!({"_meta":{"io.modelcontextprotocol/clientCapabilities":{"elicitation":{"form":{},"url":{}}}}});
+        let c = client_elicit_caps(&both);
+        assert!(c.form && c.url);
+    }
+}
