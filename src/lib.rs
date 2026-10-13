@@ -14,6 +14,7 @@
 #![warn(missing_docs)]
 
 pub mod constants;
+pub mod http;
 pub mod json;
 mod pool;
 pub mod server;
