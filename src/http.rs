@@ -1222,3 +1222,212 @@ fn decode_base64(input: &str) -> Option<String> {
     }
     Some(String::from_utf8_lossy(&out).into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn local_origin_rules() {
+        assert!(is_local_origin("http://localhost"));
+        assert!(is_local_origin("http://localhost:3000"));
+        assert!(is_local_origin("https://127.0.0.1:8080"));
+        assert!(is_local_origin("http://[::1]"));
+        assert!(is_local_origin("http://[::1]:9000"));
+        assert!(!is_local_origin("http://[::1]x"));
+        assert!(!is_local_origin("http://example.com"));
+        assert!(!is_local_origin("ftp://localhost"));
+        assert!(!is_local_origin("localhost"));
+    }
+
+    #[test]
+    fn origin_allow_list_replaces_the_default() {
+        let mut opts = HttpOptions::default();
+        assert!(origin_allowed(&opts, "http://localhost"));
+        assert!(!origin_allowed(&opts, "https://example.com"));
+        opts.allowed_origins = vec!["https://example.com".to_string()];
+        assert!(origin_allowed(&opts, "https://example.com"));
+        assert!(!origin_allowed(&opts, "http://localhost"));
+    }
+
+    #[test]
+    fn status_mapping() {
+        let e = |code: ErrorCode| {
+            json::serialize(
+                &json!({"jsonrpc":"2.0","id":1,"error":{"code":code.code(),"message":"x"}}),
+            )
+        };
+        assert_eq!(status_for(&e(ErrorCode::MethodNotFound)), 404);
+        for c in [
+            ErrorCode::ParseError,
+            ErrorCode::InvalidRequest,
+            ErrorCode::HeaderMismatch,
+            ErrorCode::MissingRequiredClientCapability,
+            ErrorCode::UnsupportedProtocolVersion,
+        ] {
+            assert_eq!(status_for(&e(c)), 400, "{c:?}");
+        }
+        assert_eq!(status_for(&e(ErrorCode::InternalError)), 200);
+        assert_eq!(status_for(&e(ErrorCode::InvalidParams)), 200);
+        assert_eq!(status_for("not json"), 200);
+        assert_eq!(status_for(r#"{"result":{}}"#), 200);
+    }
+
+    #[test]
+    fn base64_header_text() {
+        assert_eq!(header_text("plain").as_deref(), Some("plain"));
+        assert_eq!(header_text("=?base64?aGk=?=").as_deref(), Some("hi"));
+        assert_eq!(header_text("=?base64?!!!=?="), None);
+        // a value that only looks like the encoding is passed through
+        assert_eq!(
+            header_text("=?base64?aGk=?=x"),
+            Some("=?base64?aGk=?=x".to_string())
+        );
+    }
+
+    #[test]
+    fn header_checks() {
+        let mut req = HttpRequest::default();
+        // No per-call revision in the body means there is nothing to check.
+        assert!(check_headers(&json!({"method":"tools/call"}), &req).is_ok());
+
+        let msg = json!({"method":"tools/call","params":{"name":"crunch","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}});
+
+        let err = check_headers(&msg, &req).unwrap_err();
+        assert!(err.contains("missing MCP-Protocol-Version header"), "{err}");
+
+        req.headers
+            .insert("mcp-protocol-version".into(), "2026-07-28".into());
+        let err = check_headers(&msg, &req).unwrap_err();
+        assert!(err.contains("missing Mcp-Method header"), "{err}");
+
+        req.headers.insert("mcp-method".into(), "tools/call".into());
+        let err = check_headers(&msg, &req).unwrap_err();
+        assert!(err.contains("missing Mcp-Name header"), "{err}");
+
+        req.headers.insert("mcp-name".into(), "crunch".into());
+        assert!(check_headers(&msg, &req).is_ok());
+
+        req.headers.insert("mcp-name".into(), "other".into());
+        let err = check_headers(&msg, &req).unwrap_err();
+        assert!(err.contains("does not match body value 'crunch'"), "{err}");
+
+        // the base64 form is accepted
+        req.headers
+            .insert("mcp-name".into(), "=?base64?Y3J1bmNo?=".into());
+        assert!(check_headers(&msg, &req).is_ok());
+
+        // tools/list has no name field, so Mcp-Name is not required
+        req.headers.clear();
+        req.headers
+            .insert("mcp-protocol-version".into(), "2026-07-28".into());
+        req.headers.insert("mcp-method".into(), "tools/list".into());
+        assert!(check_headers(
+            &json!({"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}),
+            &req
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn request_line_and_headers_parse() {
+        let raw = "POST /mcp HTTP/1.1\r\nHost: x\r\nOrigin: http://localhost\r\n\r\n";
+        let mut r = BufReader::new(std::io::Cursor::new(raw.as_bytes().to_vec()));
+        match read_head(&mut r, 8192) {
+            HeadOutcome::Request(h) => {
+                assert_eq!(h.method, "POST");
+                assert_eq!(h.target, "/mcp");
+                assert_eq!(h.version, "HTTP/1.1");
+                assert_eq!(h.headers.get("origin").unwrap(), "http://localhost");
+                assert!(!wants_close(&h));
+            }
+            _ => panic!("expected a request"),
+        }
+    }
+
+    #[test]
+    fn keep_alive_defaults() {
+        let h = |version: &str, conn: Option<&str>| {
+            let mut headers = HashMap::new();
+            if let Some(c) = conn {
+                headers.insert("connection".to_string(), c.to_string());
+            }
+            Head {
+                method: "POST".into(),
+                target: "/mcp".into(),
+                version: version.into(),
+                headers,
+            }
+        };
+        assert!(!wants_close(&h("HTTP/1.1", None)));
+        assert!(wants_close(&h("HTTP/1.1", Some("close"))));
+        assert!(!wants_close(&h("HTTP/1.1", Some("keep-alive"))));
+        assert!(wants_close(&h("HTTP/1.0", None)));
+        assert!(!wants_close(&h("HTTP/1.0", Some("keep-alive"))));
+    }
+
+    #[test]
+    fn oversized_header_block_is_refused() {
+        let mut raw = String::from("POST /mcp HTTP/1.1\r\n");
+        for i in 0..200 {
+            raw.push_str(&format!("X-Pad-{i}: {}\r\n", "p".repeat(64)));
+        }
+        raw.push_str("\r\n");
+        let mut r = BufReader::new(std::io::Cursor::new(raw.into_bytes()));
+        match read_head(&mut r, 64 * 1024) {
+            HeadOutcome::TooLarge => {}
+            HeadOutcome::Request(_) => panic!("expected TooLarge, got a request"),
+            _ => panic!("expected TooLarge"),
+        }
+    }
+
+    #[test]
+    fn chunked_body_is_decoded() {
+        let raw = "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
+        let mut r = BufReader::new(std::io::Cursor::new(raw.as_bytes().to_vec()));
+        let head = Head {
+            method: "POST".into(),
+            target: "/mcp".into(),
+            version: "HTTP/1.1".into(),
+            headers: HashMap::from([("transfer-encoding".to_string(), "chunked".to_string())]),
+        };
+        let body = read_body(&mut r, &head, 1024).ok().unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "Wikipedia");
+
+        let mut r = BufReader::new(std::io::Cursor::new(raw.as_bytes().to_vec()));
+        match read_body(&mut r, &head, 4) {
+            Err(BodyError::TooLarge) => {}
+            _ => panic!("expected TooLarge"),
+        }
+    }
+
+    #[test]
+    fn content_length_body_is_read_and_capped() {
+        let raw = "hello";
+        let head = Head {
+            method: "POST".into(),
+            target: "/mcp".into(),
+            version: "HTTP/1.1".into(),
+            headers: HashMap::from([("content-length".to_string(), "5".to_string())]),
+        };
+        let mut r = BufReader::new(std::io::Cursor::new(raw.as_bytes().to_vec()));
+        assert_eq!(read_body(&mut r, &head, 16).ok().unwrap(), b"hello");
+
+        let mut r = BufReader::new(std::io::Cursor::new(raw.as_bytes().to_vec()));
+        match read_body(&mut r, &head, 4) {
+            Err(BodyError::TooLarge) => {}
+            _ => panic!("expected TooLarge"),
+        }
+
+        let bad = Head {
+            headers: HashMap::from([("content-length".to_string(), "nope".to_string())]),
+            ..head
+        };
+        let mut r = BufReader::new(std::io::Cursor::new(Vec::new()));
+        match read_body(&mut r, &bad, 16) {
+            Err(BodyError::Bad) => {}
+            _ => panic!("expected Bad"),
+        }
+    }
+}
