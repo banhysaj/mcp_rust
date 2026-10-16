@@ -382,3 +382,257 @@ fn boxed_registration_works() {
     );
     assert_eq!(parse(&out[0])["result"]["content"][0]["text"], "never");
 }
+
+// ---------------------------------------------------------------------------
+// Envelope handling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_errors_carry_a_null_id() {
+    let out = serve(base_server(), &["{not json".to_string()]);
+    assert_eq!(
+        out[0],
+        r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#
+    );
+}
+
+#[test]
+fn deeply_nested_messages_are_refused() {
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let out = serve(base_server(), &[deep]);
+    assert_eq!(error_code(&out[0]), -32600);
+    assert_eq!(
+        parse(&out[0])["error"]["message"],
+        "Message is nested too deeply"
+    );
+}
+
+#[test]
+fn non_objects_are_invalid_requests() {
+    let out = serve(base_server(), &["5".to_string(), "null".to_string()]);
+    assert_eq!(out.len(), 2);
+    for line in &out {
+        assert_eq!(
+            line,
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"Invalid Request"}}"#
+        );
+    }
+}
+
+#[test]
+fn method_not_found_is_reported_for_requests_only() {
+    let out = serve(
+        base_server(),
+        &[
+            init_line(),
+            initialized_line(),
+            json!({"jsonrpc":"2.0","id":9,"method":"resources/list"}).to_string(),
+            json!({"jsonrpc":"2.0","method":"resources/list"}).to_string(),
+        ],
+    );
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(error_code(&out[1]), -32601);
+    assert_eq!(
+        parse(&out[1])["error"]["message"],
+        "Method not found: resources/list"
+    );
+}
+
+#[test]
+fn batches_return_an_array_of_replies_in_order() {
+    let batch = json!([
+        {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{META_VERSION:V}}},
+        {"jsonrpc":"2.0","method":"notifications/initialized"},
+        {"jsonrpc":"2.0","id":2,"method":"ping"}
+    ])
+    .to_string();
+    let out = serve(base_server(), &[batch]);
+    assert_eq!(out.len(), 1);
+    let v = parse(&out[0]);
+    let arr = v.as_array().expect("batch reply must be an array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["id"], 1);
+    assert_eq!(arr[1]["id"], 2);
+    assert_eq!(arr[1]["result"], json!({}));
+}
+
+#[test]
+fn a_batch_with_no_replies_produces_no_output() {
+    let batch = json!([{"jsonrpc":"2.0","method":"notifications/initialized"}]).to_string();
+    let out = serve(base_server(), &[batch]);
+    assert!(out.is_empty(), "{out:?}");
+}
+
+#[test]
+fn a_bom_and_surrounding_whitespace_are_tolerated() {
+    let line = format!("\u{feff}  {}  ", stateless(1, "tools/list", json!({})));
+    let out = serve(base_server(), &[line]);
+    assert_eq!(parse(&out[0])["id"], 1);
+}
+
+#[test]
+fn a_blank_line_produces_nothing() {
+    let out = serve(base_server(), &["   ".to_string(), "".to_string()]);
+    assert!(out.is_empty(), "{out:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Progress and logging
+// ---------------------------------------------------------------------------
+
+fn crunch_server(observed_cancel: Option<Arc<AtomicBool>>) -> Server {
+    let mut server = Server::new("test-server", "9.9.9");
+    server.set_max_threads(1);
+    server.add_tool_ctx(
+        Tool::new("crunch", "A long-running job").add_parameter_simple(
+            "n",
+            PropertyType::Integer,
+            "iterations",
+        ),
+        move |a, ctx| {
+            let n = args::integer(a, "n", 0);
+            for i in 0..n {
+                if ctx.cancelled() {
+                    if let Some(flag) = &observed_cancel {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    return ToolResult::error("cancelled");
+                }
+                ctx.progress(i as f64, Some(n as f64), None);
+            }
+            ToolResult::text("done")
+        },
+    );
+    server
+}
+
+#[test]
+fn progress_events_precede_the_result() {
+    let out = serve(
+        crunch_server(None),
+        &[stateless(
+            2,
+            "tools/call",
+            json!({
+                "name": "crunch",
+                "arguments": {"n": 3},
+                "_meta": {META_VERSION: V, "progressToken": "tok-1"}
+            }),
+        )],
+    );
+    assert_eq!(out.len(), 4, "{out:?}");
+    assert_eq!(
+        out[0],
+        r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"tok-1","progress":0.0,"total":3.0}}"#
+    );
+    assert_eq!(
+        out[1],
+        r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"tok-1","progress":1.0,"total":3.0}}"#
+    );
+    assert_eq!(
+        out[2],
+        r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"tok-1","progress":2.0,"total":3.0}}"#
+    );
+    assert!(out[3].contains(r#""text":"done""#), "{}", out[3]);
+}
+
+#[test]
+fn progress_without_a_token_is_silent() {
+    let out = serve(
+        crunch_server(None),
+        &[stateless(
+            2,
+            "tools/call",
+            json!({"name":"crunch","arguments":{"n":3}}),
+        )],
+    );
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].contains("done"));
+}
+
+#[test]
+fn progress_message_and_absent_total_are_optional() {
+    let mut server = Server::new("s", "1");
+    server.set_max_threads(1);
+    server.add_tool_ctx(Tool::new("p", "d"), |_a, ctx| {
+        ctx.progress(1.5, None, Some("half way"));
+        ToolResult::text("ok")
+    });
+    let out = serve(
+        server,
+        &[stateless(
+            1,
+            "tools/call",
+            json!({"name":"p","_meta":{"progressToken":7}}),
+        )],
+    );
+    assert_eq!(
+        out[0],
+        r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":7,"progress":1.5,"message":"half way"}}"#
+    );
+}
+
+#[test]
+fn logging_level_filters_context_logs() {
+    let mut server = Server::new("s", "1");
+    server.set_max_threads(1);
+    server.add_tool_ctx(Tool::new("logger", "d"), |_a, ctx| {
+        ctx.log("debug", "dbg");
+        ctx.log("error", "err");
+        ToolResult::text("ok")
+    });
+
+    // No level set: everything passes.
+    let out = serve(
+        server,
+        &[stateless(1, "tools/call", json!({"name":"logger"}))],
+    );
+    let msgs: Vec<&String> = out
+        .iter()
+        .filter(|l| l.contains("notifications/message"))
+        .collect();
+    assert_eq!(msgs.len(), 2, "{out:?}");
+    assert_eq!(
+        msgs[0],
+        r#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"debug","data":"dbg"}}"#
+    );
+
+    // Now raise the floor to "warning": only "error" survives.
+    let mut server = Server::new("s", "1");
+    server.set_max_threads(1);
+    server.add_tool_ctx(Tool::new("logger", "d"), |_a, ctx| {
+        ctx.log("debug", "dbg");
+        ctx.log("error", "err");
+        ToolResult::text("ok")
+    });
+    let out = serve(
+        server,
+        &[
+            stateless(1, "logging/setLevel", json!({"level":"warning"})),
+            stateless(2, "tools/call", json!({"name":"logger"})),
+        ],
+    );
+    let msgs: Vec<&String> = out
+        .iter()
+        .filter(|l| l.contains("notifications/message"))
+        .collect();
+    assert_eq!(msgs.len(), 1, "{out:?}");
+    assert!(msgs[0].contains("\"level\":\"error\""), "{}", msgs[0]);
+}
+
+#[test]
+fn server_wide_notifications_go_out_through_the_transport() {
+    let mut server = base_server();
+    server.add_tool_ctx(Tool::new("notifier", "d"), |_a, ctx| {
+        ctx.notify("notifications/custom", r#"{"x":1}"#);
+        ToolResult::text("ok")
+    });
+    let out = serve(
+        server,
+        &[stateless(1, "tools/call", json!({"name":"notifier"}))],
+    );
+    assert_eq!(
+        out[0],
+        r#"{"jsonrpc":"2.0","method":"notifications/custom","params":{"x":1}}"#
+    );
+}
