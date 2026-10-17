@@ -1,0 +1,406 @@
+//! End-to-end tests for the Streamable HTTP transport.
+//!
+//! These start a real [`HttpServer`] on an ephemeral port and speak HTTP/1.1 over a
+//! real socket, so the request parsing, routing, status mapping and SSE framing are
+//! all exercised.
+
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use mcp_async::{
+    args, AuthDecision, HttpOptions, HttpRequest, HttpServer, PropertyType, Server, Tool,
+    ToolResult,
+};
+use serde_json::{json, Value};
+
+const V: &str = "2026-07-28";
+const META_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+fn base_server() -> Server {
+    let mut server = Server::new("http-test", "1.0.0");
+    server.set_max_threads(2);
+    server.add_tool(
+        Tool::new("echo", "Echo").add_parameter_simple("text", PropertyType::String, "what"),
+        |a| ToolResult::text(args::str(a, "text", "")),
+    );
+    server.add_tool_ctx(Tool::new("who", "Report the principal"), |_a, ctx| {
+        ToolResult::text(ctx.principal())
+    });
+    server
+}
+
+fn start(server: Server, mut opts: HttpOptions) -> (u16, Arc<HttpServer>) {
+    // Every test gets its own ephemeral port so they can run in parallel.
+    opts.port = 0;
+    let http = Arc::new(HttpServer::new(Arc::new(server), opts));
+    assert!(http.listen_in_background(), "could not bind");
+    let port = http.port();
+    assert!(port > 0, "no port was bound");
+    (port, http)
+}
+
+/// A plain JSON content type.
+const JSON_CT: (&str, &str) = ("Content-Type", "application/json");
+/// For `2026-07-28` requests the revision header must agree with `_meta`.
+const HDR_VERSION: (&str, &str) = ("MCP-Protocol-Version", V);
+
+fn init_body() -> String {
+    json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name":"c","version":"1"}}
+    })
+    .to_string()
+}
+
+/// A stateless `tools/call` body.
+///
+/// Extra `params` are merged in; a `_meta` key in `extra` is merged *into* the
+/// per-call `_meta` rather than replacing it, so a `progressToken` cannot
+/// accidentally drop the protocol revision.
+fn call_body(id: i64, name: &str, extra: Value) -> String {
+    let mut meta = json!({ META_VERSION: V });
+    let mut extra = extra;
+    if let Value::Object(e) = &mut extra {
+        if let Some(Value::Object(m)) = e.remove("_meta") {
+            let slot = meta.as_object_mut().expect("meta is an object");
+            for (k, v) in m {
+                slot.insert(k, v);
+            }
+        }
+    }
+
+    let mut params = json!({ "name": name });
+    if let Value::Object(e) = extra {
+        let slot = params.as_object_mut().expect("params is an object");
+        for (k, v) in e {
+            slot.insert(k, v);
+        }
+    }
+    params
+        .as_object_mut()
+        .expect("params is an object")
+        .insert("_meta".to_string(), meta);
+
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":params}).to_string()
+}
+
+fn list_body() -> String {
+    json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{META_VERSION:V}}})
+        .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Raw HTTP client
+// ---------------------------------------------------------------------------
+
+fn request_bytes(method: &str, path: &str, headers: &[(&str, &str)], body: &str) -> String {
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
+    for (k, v) in headers {
+        req.push_str(k);
+        req.push_str(": ");
+        req.push_str(v);
+        req.push_str("\r\n");
+    }
+    req.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    req.push_str("Connection: close\r\n\r\n");
+    req.push_str(body);
+    req
+}
+
+fn connect(port: u16) -> TcpStream {
+    let s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    s
+}
+
+/// Send one request and read until the server closes.
+fn exchange(port: u16, spec: &str) -> Vec<u8> {
+    let mut s = connect(port);
+    s.write_all(spec.as_bytes()).unwrap();
+    s.flush().unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    out
+}
+
+struct Resp {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+    raw: String,
+}
+
+impl Resp {
+    fn header(&self, name: &str) -> String {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or_else(|e| panic!("not JSON ({e}): {}", self.body))
+    }
+}
+
+fn parse_response(bytes: &[u8]) -> Resp {
+    let raw = String::from_utf8_lossy(bytes).into_owned();
+    let (head, body) = match raw.find("\r\n\r\n") {
+        Some(i) => (&raw[..i], &raw[i + 4..]),
+        None => (raw.as_str(), ""),
+    };
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("bad status line: {status_line:?}"));
+    let headers = lines
+        .filter_map(|l| {
+            l.split_once(':')
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        })
+        .collect();
+    Resp {
+        status,
+        headers,
+        body: body.to_string(),
+        raw,
+    }
+}
+
+fn post(port: u16, path: &str, headers: &[(&str, &str)], body: &str) -> Resp {
+    parse_response(&exchange(port, &request_bytes("POST", path, headers, body)))
+}
+
+fn post_json(port: u16, body: &str) -> Resp {
+    post(port, "/mcp", &[("Content-Type", "application/json")], body)
+}
+
+/// Read exactly one `Content-Length`-delimited response from a live connection.
+fn read_one_response(s: &mut TcpStream) -> (u16, String) {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match s.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => head.push(byte[0]),
+            Err(e) => panic!("read failed: {e}"),
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|x| x.parse().ok())
+        .unwrap_or(0);
+    let len = head
+        .split("\r\n")
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        s.read_exact(&mut body).expect("short body");
+    }
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Decode a `Transfer-Encoding: chunked` payload.
+fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let start = i;
+        while i < raw.len() && raw[i] != b'\n' {
+            i += 1;
+        }
+        if i >= raw.len() {
+            break;
+        }
+        let line = String::from_utf8_lossy(&raw[start..i]).trim().to_string();
+        i += 1;
+        let size = usize::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16)
+            .unwrap_or_else(|_| panic!("bad chunk size {line:?}"));
+        if size == 0 {
+            break;
+        }
+        out.extend_from_slice(&raw[i..i + size]);
+        i += size + 2;
+    }
+    out
+}
+
+fn sse_body(resp: &Resp) -> String {
+    let idx = resp.raw.find("\r\n\r\n").expect("no header terminator") + 4;
+    let raw = resp.raw.as_bytes();
+    String::from_utf8_lossy(&dechunk(&raw[idx..])).into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Happy paths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn post_initialize_returns_json() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = post_json(port, &init_body());
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.header("content-type"), "application/json");
+    let v = resp.json();
+    assert_eq!(v["id"], 1);
+    assert_eq!(v["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(v["result"]["serverInfo"]["name"], "http-test");
+    // `initialize` is always answered in the stateful shape.
+    assert!(v["result"].get("resultType").is_none());
+    http.stop();
+}
+
+#[test]
+fn stateless_tools_list_carries_the_cache_hint() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = post(
+        port,
+        "/mcp",
+        &[JSON_CT, HDR_VERSION, ("Mcp-Method", "tools/list")],
+        &list_body(),
+    );
+    assert_eq!(resp.status, 200);
+    let v = resp.json();
+    assert_eq!(v["result"]["resultType"], "complete");
+    assert_eq!(v["result"]["ttlMs"], 0);
+    assert_eq!(v["result"]["cacheScope"], "private");
+    assert_eq!(v["result"]["tools"][0]["name"], "echo");
+    http.stop();
+}
+
+#[test]
+fn a_notification_is_acknowledged_with_202_and_no_body() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let body = json!({"jsonrpc":"2.0","method":"notifications/initialized"}).to_string();
+    let resp = post_json(port, &body);
+    assert_eq!(resp.status, 202);
+    assert!(resp.body.is_empty(), "{:?}", resp.body);
+    http.stop();
+}
+
+#[test]
+fn keep_alive_serves_two_requests_on_one_connection() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let mut s = connect(port);
+    let one = format!(
+        "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        init_body().len(),
+        init_body()
+    );
+    s.write_all(one.as_bytes()).unwrap();
+    s.flush().unwrap();
+    let (status1, body1) = read_one_response(&mut s);
+    assert_eq!(status1, 200);
+    assert_eq!(serde_json::from_str::<Value>(&body1).unwrap()["id"], 1);
+
+    let two_body = list_body();
+    let two = format!(
+        "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+         MCP-Protocol-Version: {V}\r\nMcp-Method: tools/list\r\nContent-Length: {}\r\n\r\n{}",
+        two_body.len(),
+        two_body
+    );
+    s.write_all(two.as_bytes()).unwrap();
+    s.flush().unwrap();
+    let (status2, body2) = read_one_response(&mut s);
+    assert_eq!(status2, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body2).unwrap()["result"]["tools"][0]["name"],
+        "echo"
+    );
+    drop(s);
+    http.stop();
+}
+
+#[test]
+fn a_chunked_request_body_is_accepted() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let body = list_body();
+    let spec = format!(
+        "POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+         MCP-Protocol-Version: {V}\r\nMcp-Method: tools/list\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+        body.len(),
+        body
+    );
+    let resp = parse_response(&exchange(port, &spec));
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["result"]["tools"][0]["name"], "echo");
+    http.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn get_and_delete_get_405_with_allow_post() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    for method in ["GET", "DELETE"] {
+        let resp = parse_response(&exchange(
+            port,
+            &format!("{method} /mcp HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+        ));
+        assert_eq!(resp.status, 405, "{method}");
+        assert_eq!(resp.header("allow"), "POST", "{method}");
+        assert!(resp.body.is_empty());
+    }
+    http.stop();
+}
+
+#[test]
+fn other_methods_and_paths_get_404() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let put = parse_response(&exchange(
+        port,
+        "PUT /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    ));
+    assert_eq!(put.status, 404);
+
+    let wrong_path = post(port, "/nope", &[], &init_body());
+    assert_eq!(wrong_path.status, 404);
+    http.stop();
+}
+
+#[test]
+fn a_bad_request_line_is_rejected() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = parse_response(&exchange(port, "GARBAGE\r\n\r\n"));
+    assert_eq!(resp.status, 400);
+    http.stop();
+}
+
+#[test]
+fn an_oversized_body_is_rejected_with_413() {
+    let opts = HttpOptions {
+        max_body_bytes: 32,
+        ..Default::default()
+    };
+    let (port, http) = start(base_server(), opts);
+    let big = json!({"jsonrpc":"2.0","id":1,"method":"ping","params":{"pad":"x".repeat(200)}})
+        .to_string();
+    let resp = post_json(port, &big);
+    assert_eq!(resp.status, 413);
+    http.stop();
+}
