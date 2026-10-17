@@ -636,3 +636,367 @@ fn server_wide_notifications_go_out_through_the_transport() {
         r#"{"jsonrpc":"2.0","method":"notifications/custom","params":{"x":1}}"#
     );
 }
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_cancellation_notification_stops_a_running_tool() {
+    let observed = Arc::new(AtomicBool::new(false));
+    let out = serve(
+        crunch_server(Some(Arc::clone(&observed))),
+        &[
+            stateless(
+                2,
+                "tools/call",
+                json!({"name":"crunch","arguments":{"n":1_000_000}}),
+            ),
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}})
+                .to_string(),
+        ],
+    );
+
+    assert!(
+        observed.load(Ordering::SeqCst),
+        "the handler never saw the cancellation"
+    );
+    let replies: Vec<&String> = out.iter().filter(|l| l.contains("\"id\":2")).collect();
+    assert_eq!(replies.len(), 1, "{out:?}");
+    assert!(
+        replies[0].contains(r#""text":"cancelled""#),
+        "{}",
+        replies[0]
+    );
+    assert!(replies[0].contains(r#""isError":true"#));
+}
+
+#[test]
+fn cancelling_an_unknown_request_is_harmless() {
+    let out = serve(
+        base_server(),
+        &[
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}})
+                .to_string(),
+        ],
+    );
+    assert!(out.is_empty(), "{out:?}");
+}
+
+#[test]
+fn a_plain_tool_cannot_observe_cancellation_but_still_runs() {
+    let out = serve(
+        base_server(),
+        &[
+            stateless(
+                5,
+                "tools/call",
+                json!({"name":"echo","arguments":{"text":"still here"}}),
+            ),
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}})
+                .to_string(),
+        ],
+    );
+    assert_eq!(out.len(), 1);
+    assert!(out[0].contains("still here"), "{}", out[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Elicitation
+// ---------------------------------------------------------------------------
+
+fn ask_server() -> Server {
+    let mut server = Server::new("test-server", "9.9.9");
+    server.set_max_threads(1);
+    server.add_tool_ctx(Tool::new("ask", "Ask the user"), |_a, ctx| {
+        if !ctx.has_answer("how_many") {
+            return ToolResult::elicit(Elicitation::make_form("how_many", "How many?").add_field(
+                "n",
+                PropertyType::Integer,
+                "iterations",
+            ))
+            .with_request_state("state-1");
+        }
+        if !ctx.accepted("how_many") {
+            return ToolResult::error(format!("declined: {}", ctx.answer_action("how_many")));
+        }
+        let n = ctx
+            .answer_content("how_many")
+            .and_then(|c| c.get("n"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+        ToolResult::text(format!("n={n} state={}", ctx.request_state()))
+    });
+    server
+}
+
+/// `tools/call` params for a client that advertises form-mode elicitation.
+fn eliciting_params(name: &str, extra: Value) -> Value {
+    let mut params = json!({
+        "name": name,
+        "_meta": {
+            META_VERSION: V,
+            "io.modelcontextprotocol/clientCapabilities": {"elicitation": {"form": {}}}
+        }
+    });
+    if let (Some(p), Value::Object(e)) = (params.as_object_mut(), extra) {
+        for (k, v) in e {
+            p.insert(k, v);
+        }
+    }
+    params
+}
+
+#[test]
+fn a_tool_can_ask_for_input_and_run_again_with_the_answer() {
+    let first = stateless(2, "tools/call", eliciting_params("ask", json!({})));
+    let second = stateless(
+        3,
+        "tools/call",
+        eliciting_params(
+            "ask",
+            json!({
+                "requestState": "state-1",
+                "inputResponses": {"how_many": {"action": "accept", "content": {"n": 5}}}
+            }),
+        ),
+    );
+    let out = serve(ask_server(), &[first, second]);
+
+    let v = parse(&out[0]);
+    assert_eq!(v["result"]["resultType"], "input_required");
+    assert_eq!(v["result"]["requestState"], "state-1");
+    assert_eq!(
+        v["result"]["inputRequests"]["how_many"],
+        json!({
+            "method": "elicitation/create",
+            "params": {
+                "mode": "form",
+                "message": "How many?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"n": {"type": "integer", "description": "iterations"}},
+                    "required": ["n"]
+                }
+            }
+        })
+    );
+
+    let v2 = parse(&out[1]);
+    assert_eq!(v2["result"]["content"][0]["text"], "n=5 state=state-1");
+}
+
+#[test]
+fn a_declined_elicitation_is_reported_to_the_tool() {
+    let out = serve(
+        ask_server(),
+        &[stateless(
+            2,
+            "tools/call",
+            eliciting_params(
+                "ask",
+                json!({"inputResponses": {"how_many": {"action": "decline"}}}),
+            ),
+        )],
+    );
+    let v = parse(&out[0]);
+    assert_eq!(v["result"]["isError"], true);
+    assert_eq!(v["result"]["content"][0]["text"], "declined: decline");
+}
+
+#[test]
+fn elicitation_requires_the_latest_protocol_version() {
+    let mut server = ask_server();
+    server.set_max_threads(1);
+    let out = serve(
+        server,
+        &[
+            init_line(),
+            initialized_line(),
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "ask"}
+            })
+            .to_string(),
+        ],
+    );
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(error_code(&out[1]), -32021);
+    assert!(parse(&out[1])["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains(V));
+}
+
+#[test]
+fn elicitation_requires_the_client_capability() {
+    let out = serve(
+        ask_server(),
+        &[stateless(2, "tools/call", json!({"name":"ask"}))],
+    );
+    assert_eq!(error_code(&out[0]), -32021);
+    assert_eq!(
+        parse(&out[0])["error"]["message"],
+        "Client does not support form mode elicitation"
+    );
+}
+
+#[test]
+fn url_mode_elicitation_needs_url_capability() {
+    let mut server = Server::new("s", "1");
+    server.set_max_threads(1);
+    server.add_tool_ctx(Tool::new("go", "d"), |_a, _ctx| {
+        ToolResult::elicit(Elicitation::make_url(
+            "go",
+            "Open this",
+            "https://example.com/x",
+        ))
+    });
+    let params = eliciting_params("go", json!({}));
+    let out = serve(server, &[stateless(1, "tools/call", params)]);
+    assert_eq!(
+        parse(&out[0])["error"]["message"],
+        "Client does not support url mode elicitation"
+    );
+}
+
+#[test]
+fn an_empty_elicitation_capability_means_form_mode() {
+    let params = json!({
+        "name": "ask",
+        "_meta": {
+            META_VERSION: V,
+            "io.modelcontextprotocol/clientCapabilities": {"elicitation": {}}
+        }
+    });
+    let out = serve(ask_server(), &[stateless(1, "tools/call", params)]);
+    assert_eq!(parse(&out[0])["result"]["resultType"], "input_required");
+}
+
+#[test]
+fn a_plain_tool_that_elicits_reports_a_configuration_error() {
+    let mut server = Server::new("s", "1");
+    server.set_max_threads(1);
+    server.add_tool(Tool::new("plain", "d"), |_a| {
+        ToolResult::elicit(Elicitation::make_form("k", "m"))
+    });
+    let out = serve(
+        server,
+        &[stateless(
+            1,
+            "tools/call",
+            eliciting_params("plain", json!({})),
+        )],
+    );
+    assert_eq!(error_code(&out[0]), -32603);
+    assert_eq!(
+        parse(&out[0])["error"]["message"],
+        "Tool plain asked for input but was added with add_tool, not add_tool_ctx, so it can't read the answers"
+    );
+}
+
+#[test]
+fn an_elicitation_with_a_broken_schema_is_an_internal_error() {
+    let mut server = Server::new("s", "1");
+    server.set_max_threads(1);
+    server.add_tool_ctx(Tool::new("bad", "d"), |_a, _ctx| {
+        ToolResult::elicit(Elicitation::make_form("k", "m").set_schema("{not json"))
+    });
+    let out = serve(
+        server,
+        &[stateless(
+            1,
+            "tools/call",
+            eliciting_params("bad", json!({})),
+        )],
+    );
+    assert_eq!(error_code(&out[0]), -32603);
+    assert_eq!(
+        parse(&out[0])["error"]["message"],
+        "Elicitation 'k' has a schema that is not valid JSON"
+    );
+}
+
+#[test]
+fn an_elicitation_field_must_be_a_primitive() {
+    let mut server = Server::new("s", "1");
+    server.set_max_threads(1);
+    server.add_tool_ctx(Tool::new("bad", "d"), |_a, _ctx| {
+        ToolResult::elicit(Elicitation::make_form("k", "m").add_field(
+            "o",
+            PropertyType::Object,
+            "nope",
+        ))
+    });
+    let out = serve(
+        server,
+        &[stateless(
+            1,
+            "tools/call",
+            eliciting_params("bad", json!({})),
+        )],
+    );
+    assert_eq!(
+        parse(&out[0])["error"]["message"],
+        "Elicitation 'k' field 'o' must be a string, number, integer or boolean"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn many_calls_can_be_in_flight_at_once() {
+    const REQUESTS: i64 = 40;
+    let mut server = Server::new("test-server", "9.9.9");
+    server.set_max_threads(4);
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let live_tool = Arc::clone(&live);
+    let peak_tool = Arc::clone(&peak);
+    server.add_tool_ctx(
+        Tool::new("work", "d").add_parameter_simple("i", PropertyType::Integer, "index"),
+        move |a, _ctx| {
+            let now = live_tool.fetch_add(1, Ordering::SeqCst) + 1;
+            peak_tool.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(20));
+            live_tool.fetch_sub(1, Ordering::SeqCst);
+            ToolResult::text(format!("i={}", args::integer(a, "i", -1)))
+        },
+    );
+
+    let mut input = Vec::new();
+    for i in 0..REQUESTS {
+        input.push(stateless(
+            i,
+            "tools/call",
+            json!({"name":"work","arguments":{"i":i}}),
+        ));
+    }
+
+    let started = Instant::now();
+    let out = serve(server, &input);
+    let elapsed = started.elapsed();
+
+    assert_eq!(out.len() as i64, REQUESTS, "{out:?}");
+    let mut ids: Vec<i64> = out
+        .iter()
+        .map(|l| parse(l)["id"].as_i64().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (0..REQUESTS).collect::<Vec<_>>());
+    for line in &out {
+        let v = parse(line);
+        let id = v["id"].as_i64().unwrap();
+        assert_eq!(v["result"]["content"][0]["text"], format!("i={id}"));
+    }
+    assert!(
+        peak.load(Ordering::SeqCst) > 1,
+        "calls never actually overlapped"
+    );
+    assert!(
+        elapsed < Duration::from_millis(20 * REQUESTS as u64),
+        "calls did not run in parallel: {elapsed:?}"
+    );
+}
