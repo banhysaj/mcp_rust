@@ -404,3 +404,306 @@ fn an_oversized_body_is_rejected_with_413() {
     assert_eq!(resp.status, 413);
     http.stop();
 }
+
+// ---------------------------------------------------------------------------
+// Origin and auth
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_foreign_origin_is_refused() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = post(
+        port,
+        "/mcp",
+        &[
+            ("Origin", "http://evil.example"),
+            ("Content-Type", "application/json"),
+        ],
+        &init_body(),
+    );
+    assert_eq!(resp.status, 403);
+    assert_eq!(resp.json()["error"]["code"], -32600);
+    assert_eq!(resp.json()["error"]["message"], "Origin not allowed");
+    http.stop();
+}
+
+#[test]
+fn localhost_origins_and_missing_origins_pass() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    for origin in [
+        "http://localhost:5173",
+        "https://127.0.0.1",
+        "http://[::1]:9000",
+    ] {
+        let resp = post(
+            port,
+            "/mcp",
+            &[("Origin", origin), ("Content-Type", "application/json")],
+            &init_body(),
+        );
+        assert_eq!(resp.status, 200, "origin {origin}");
+    }
+    // Server-to-server: no Origin at all.
+    assert_eq!(post_json(port, &init_body()).status, 200);
+    http.stop();
+}
+
+#[test]
+fn an_explicit_origin_allow_list_replaces_the_localhost_default() {
+    let opts = HttpOptions {
+        allowed_origins: vec!["https://ok.example".to_string()],
+        ..Default::default()
+    };
+    let (port, http) = start(base_server(), opts);
+
+    let denied = post(
+        port,
+        "/mcp",
+        &[
+            ("Origin", "http://localhost"),
+            ("Content-Type", "application/json"),
+        ],
+        &init_body(),
+    );
+    assert_eq!(denied.status, 403);
+
+    let allowed = post(
+        port,
+        "/mcp",
+        &[
+            ("Origin", "https://ok.example"),
+            ("Content-Type", "application/json"),
+        ],
+        &init_body(),
+    );
+    assert_eq!(allowed.status, 200);
+    http.stop();
+}
+
+#[test]
+fn a_denied_authorization_returns_401_with_the_challenge() {
+    let opts = HttpOptions {
+        authorize: Some(Arc::new(|_req: &HttpRequest| {
+            AuthDecision::deny("Bearer resource_metadata=\"https://example.com/prm\"")
+        })),
+        ..Default::default()
+    };
+    let (port, http) = start(base_server(), opts);
+    let resp = post_json(port, &init_body());
+    assert_eq!(resp.status, 401);
+    assert_eq!(
+        resp.header("www-authenticate"),
+        "Bearer resource_metadata=\"https://example.com/prm\""
+    );
+    http.stop();
+}
+
+#[test]
+fn an_allowed_authorization_exposes_the_principal_to_tools() {
+    let opts = HttpOptions {
+        authorize: Some(Arc::new(|req: &HttpRequest| {
+            if req.header("Authorization") == "Bearer secret" {
+                AuthDecision::allow_as("user-1")
+            } else {
+                AuthDecision::deny("Bearer")
+            }
+        })),
+        ..Default::default()
+    };
+    let (port, http) = start(base_server(), opts);
+
+    let denied = post_json(port, &init_body());
+    assert_eq!(denied.status, 401);
+    assert_eq!(denied.header("www-authenticate"), "Bearer");
+
+    let allowed = post(
+        port,
+        "/mcp",
+        &[
+            ("Authorization", "Bearer secret"),
+            JSON_CT,
+            HDR_VERSION,
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "who"),
+        ],
+        &call_body(3, "who", json!({})),
+    );
+    assert_eq!(allowed.status, 200);
+    assert_eq!(allowed.json()["result"]["content"][0]["text"], "user-1");
+    http.stop();
+}
+
+// ---------------------------------------------------------------------------
+// Body / header validation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_parse_error_is_a_400() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = post_json(port, "{oops");
+    assert_eq!(resp.status, 400);
+    assert_eq!(resp.json()["error"]["code"], -32700);
+    assert_eq!(resp.json()["error"]["message"], "Parse error");
+    http.stop();
+}
+
+#[test]
+fn a_non_object_body_is_a_400() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = post_json(port, "[1,2,3]");
+    assert_eq!(resp.status, 400);
+    assert_eq!(resp.json()["error"]["code"], -32600);
+    assert_eq!(
+        resp.json()["error"]["message"],
+        "Body must be a single JSON-RPC message"
+    );
+    http.stop();
+}
+
+#[test]
+fn a_deeply_nested_body_is_a_400() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let resp = post_json(port, &deep);
+    assert_eq!(resp.status, 400);
+    assert_eq!(
+        resp.json()["error"]["message"],
+        "Message is nested too deeply"
+    );
+    http.stop();
+}
+
+#[test]
+fn missing_protocol_headers_are_a_header_mismatch() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = post_json(
+        port,
+        &call_body(2, "echo", json!({"arguments": {"text": "hi"}})),
+    );
+    assert_eq!(resp.status, 400);
+    let v = resp.json();
+    assert_eq!(v["error"]["code"], -32020);
+    // The id sits on the envelope, not inside the error object.
+    assert_eq!(v["id"], 2);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("missing MCP-Protocol-Version header"),
+        "{v}"
+    );
+    http.stop();
+}
+
+#[test]
+fn matching_protocol_headers_are_accepted() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = post(
+        port,
+        "/mcp",
+        &[
+            ("Content-Type", "application/json"),
+            ("MCP-Protocol-Version", V),
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "echo"),
+        ],
+        &call_body(2, "echo", json!({"arguments": {"text": "hi"}})),
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["result"]["content"][0]["text"], "hi");
+    http.stop();
+}
+
+#[test]
+fn a_base64_mcp_name_header_is_accepted() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    // "echo" in base64 is "ZWNobw==".
+    let resp = post(
+        port,
+        "/mcp",
+        &[
+            ("Content-Type", "application/json"),
+            ("MCP-Protocol-Version", V),
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "=?base64?ZWNobw==?="),
+        ],
+        &call_body(2, "echo", json!({"arguments": {"text": "hi"}})),
+    );
+    assert_eq!(resp.status, 200);
+    http.stop();
+}
+
+#[test]
+fn a_mismatched_mcp_name_header_is_rejected() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+    let resp = post(
+        port,
+        "/mcp",
+        &[
+            ("Content-Type", "application/json"),
+            ("MCP-Protocol-Version", V),
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "something-else"),
+        ],
+        &call_body(2, "echo", json!({"arguments": {"text": "hi"}})),
+    );
+    assert_eq!(resp.status, 400);
+    assert_eq!(resp.json()["error"]["code"], -32020);
+    assert!(resp.json()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("does not match body value 'echo'"));
+    http.stop();
+}
+
+#[test]
+fn status_codes_follow_the_jsonrpc_error_code() {
+    let (port, http) = start(base_server(), HttpOptions::default());
+
+    // Unknown method -> -32601 -> 404
+    let unknown =
+        json!({"jsonrpc":"2.0","id":1,"method":"nope","params":{"_meta":{META_VERSION:V}}})
+            .to_string();
+    let resp = post(
+        port,
+        "/mcp",
+        &[JSON_CT, HDR_VERSION, ("Mcp-Method", "nope")],
+        &unknown,
+    );
+    assert_eq!(resp.status, 404);
+    assert_eq!(resp.json()["error"]["code"], -32601);
+
+    // Invalid params -> -32602 -> 200 (the call itself was well formed)
+    let bad = post(
+        port,
+        "/mcp",
+        &[
+            JSON_CT,
+            HDR_VERSION,
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "ghost"),
+        ],
+        &call_body(2, "ghost", json!({})),
+    );
+    assert_eq!(bad.status, 200);
+    assert_eq!(bad.json()["error"]["code"], -32602);
+
+    // An unsupported per-call version -> -32022 -> 400
+    let old =
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{META_VERSION:"1999-01-01"}}})
+            .to_string();
+    let resp = post(
+        port,
+        "/mcp",
+        &[
+            JSON_CT,
+            ("MCP-Protocol-Version", "1999-01-01"),
+            ("Mcp-Method", "tools/list"),
+        ],
+        &old,
+    );
+    assert_eq!(resp.status, 400);
+    assert_eq!(resp.json()["error"]["code"], -32022);
+
+    http.stop();
+}
