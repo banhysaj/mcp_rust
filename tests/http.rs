@@ -707,3 +707,188 @@ fn status_codes_follow_the_jsonrpc_error_code() {
 
     http.stop();
 }
+
+// ---------------------------------------------------------------------------
+// SSE
+// ---------------------------------------------------------------------------
+
+fn crunch_server() -> Server {
+    let mut server = Server::new("sse-test", "1.0.0");
+    server.add_tool_ctx(
+        Tool::new("crunch", "Long job").add_parameter_simple("n", PropertyType::Integer, "iters"),
+        |a, ctx| {
+            let n = args::integer(a, "n", 0);
+            for i in 0..n {
+                if ctx.cancelled() {
+                    return ToolResult::error("cancelled");
+                }
+                ctx.progress(i as f64, Some(n as f64), Some("working"));
+                ctx.log("info", "step");
+            }
+            ToolResult::text("done")
+        },
+    );
+    server
+}
+
+#[test]
+fn tools_call_streams_sse_when_the_client_asks_for_it() {
+    let (port, http) = start(crunch_server(), HttpOptions::default());
+    let body = call_body(
+        4,
+        "crunch",
+        json!({"arguments": {"n": 2}, "_meta": {"progressToken": "tok"}}),
+    );
+    let resp = post(
+        port,
+        "/mcp",
+        &[
+            JSON_CT,
+            HDR_VERSION,
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "crunch"),
+            ("Accept", "text/event-stream"),
+        ],
+        &body,
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.header("content-type"), "text/event-stream");
+    assert_eq!(resp.header("cache-control"), "no-cache");
+    assert_eq!(resp.header("x-accel-buffering"), "no");
+    assert_eq!(resp.header("transfer-encoding"), "chunked");
+
+    let stream = sse_body(&resp);
+    let events: Vec<&str> = stream.split("\n\n").filter(|e| !e.is_empty()).collect();
+    // 2 progress + 2 log + the result
+    assert_eq!(events.len(), 5, "{stream:?}");
+
+    let payload = |e: &str| -> Value {
+        let data = e
+            .strip_prefix("data: ")
+            .unwrap_or_else(|| panic!("bad event {e:?}"));
+        serde_json::from_str(data).unwrap()
+    };
+
+    assert_eq!(payload(events[0])["method"], "notifications/progress");
+    assert_eq!(payload(events[0])["params"]["progress"], 0.0);
+    assert_eq!(payload(events[0])["params"]["total"], 2.0);
+    assert_eq!(payload(events[0])["params"]["progressToken"], "tok");
+    assert_eq!(payload(events[0])["params"]["message"], "working");
+    assert_eq!(payload(events[1])["method"], "notifications/message");
+    assert_eq!(payload(events[1])["params"]["data"], "step");
+
+    let last = payload(events[4]);
+    assert_eq!(last["id"], 4);
+    assert_eq!(last["result"]["content"][0]["text"], "done");
+    assert_eq!(last["result"]["resultType"], "complete");
+
+    http.stop();
+}
+
+#[test]
+fn a_plain_json_reply_is_used_when_sse_is_not_accepted() {
+    let (port, http) = start(crunch_server(), HttpOptions::default());
+    let body = call_body(4, "crunch", json!({"arguments": {"n": 1}}));
+    let resp = post(
+        port,
+        "/mcp",
+        &[
+            JSON_CT,
+            HDR_VERSION,
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "crunch"),
+        ],
+        &body,
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.header("content-type"), "application/json");
+    assert_eq!(resp.json()["result"]["content"][0]["text"], "done");
+    http.stop();
+}
+
+#[test]
+fn closing_an_sse_stream_cancels_the_tool() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    let mut server = Server::new("s", "1.0.0");
+    server.add_tool_ctx(Tool::new("long", "Runs until cancelled"), move |_a, ctx| {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            if ctx.cancelled() {
+                flag.store(true, Ordering::SeqCst);
+                return ToolResult::error("cancelled");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        ToolResult::text("timed out")
+    });
+
+    let (port, http) = start(server, HttpOptions::default());
+    let body = call_body(4, "long", json!({}));
+    let mut s = connect(port);
+    let spec = request_bytes(
+        "POST",
+        "/mcp",
+        &[
+            JSON_CT,
+            HDR_VERSION,
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "long"),
+            ("Accept", "text/event-stream"),
+        ],
+        &body,
+    );
+    s.write_all(spec.as_bytes()).unwrap();
+    s.flush().unwrap();
+
+    // Wait for the response head, then hang up mid-call.
+    let mut buf = [0u8; 256];
+    let n = s.read(&mut buf).expect("no response head");
+    assert!(n > 0);
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    drop(s);
+
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while Instant::now() < deadline && !cancelled.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "the handler never observed the client hang-up"
+    );
+    http.stop();
+}
+
+#[test]
+fn sse_keep_alive_comments_are_emitted_while_idle() {
+    let mut server = Server::new("s", "1.0.0");
+    server.add_tool_ctx(Tool::new("slow", "Sleeps"), |_a, _ctx| {
+        std::thread::sleep(Duration::from_millis(2500));
+        ToolResult::text("done")
+    });
+    let opts = HttpOptions {
+        keep_alive_seconds: 1,
+        ..Default::default()
+    };
+    let (port, http) = start(server, opts);
+
+    let resp = post(
+        port,
+        "/mcp",
+        &[
+            JSON_CT,
+            HDR_VERSION,
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "slow"),
+            ("Accept", "text/event-stream"),
+        ],
+        &call_body(4, "slow", json!({})),
+    );
+    let stream = sse_body(&resp);
+    assert!(
+        stream.contains(": keep-alive"),
+        "no keep-alive comment in {stream:?}"
+    );
+    assert!(stream.contains("\"done\""), "{stream:?}");
+    http.stop();
+}
