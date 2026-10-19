@@ -1,6 +1,6 @@
 [package]
 name = "mcp-async"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.74"
 description = "MCP server library with worker-pool tool dispatch, cooperative cancellation, and stdio and Streamable HTTP transports"
