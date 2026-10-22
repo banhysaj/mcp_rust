@@ -458,6 +458,12 @@ fn handle_connection(
             let _ = writer.flush();
         }
 
+        // The idle timeout above bounds the wait for a request to begin. A body can
+        // legitimately arrive in bursts, so give it a longer inactivity window rather
+        // than dropping a slow upload the moment it pauses.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(
+            opts.read_timeout_seconds.max(30),
+        )));
         let body = match read_body(&mut reader, &head, opts.max_body_bytes) {
             Ok(b) => b,
             Err(BodyError::TooLarge) => {
@@ -484,8 +490,12 @@ fn handle_connection(
 
         match routed {
             Routed::Response(r) => {
-                write_response(&mut writer, &r, close_after)?;
-                if close_after {
+                served += 1;
+                // Close after the last request we will serve, and say so, rather than
+                // dropping a kept-alive socket the client still thinks it can reuse.
+                let close = close_after || served >= MAX_KEEP_ALIVE_REQUESTS;
+                write_response(&mut writer, &r, close)?;
+                if close {
                     return Ok(());
                 }
             }
@@ -493,11 +503,6 @@ fn handle_connection(
                 serve_sse(&stream, &server, body, scope, opts.keep_alive_seconds);
                 return Ok(()); // an SSE reply always ends the connection
             }
-        }
-
-        served += 1;
-        if served >= MAX_KEEP_ALIVE_REQUESTS {
-            return Ok(());
         }
     }
 }
@@ -743,7 +748,9 @@ fn read_chunked<R: BufRead>(r: &mut R, max_body_bytes: usize) -> Result<Vec<u8>,
             }
             break;
         }
-        if out.len() + size > max_body_bytes {
+        // `size` comes straight off the wire, so `out.len() + size` could overflow and
+        // wrap past the limit; compare against the remaining budget instead.
+        if size > max_body_bytes.saturating_sub(out.len()) {
             return Err(BodyError::TooLarge);
         }
         let mut buf = vec![0u8; size];
@@ -960,10 +967,21 @@ fn pump<W: Write>(
             idle = 0;
         }
 
-        if st.lock().done {
-            write_last_chunk(w)?;
-            w.flush()?;
-            return Ok(());
+        // Finish only once the worker is done AND the queue is drained. The final
+        // reply is pushed together with `done`, so testing `done` alone could skip an
+        // event enqueued in the gap between the drain above and this check.
+        {
+            let guard = st.lock();
+            if guard.done {
+                if guard.events.is_empty() {
+                    drop(guard);
+                    write_last_chunk(w)?;
+                    w.flush()?;
+                    return Ok(());
+                }
+                drop(guard);
+                continue;
+            }
         }
 
         {
@@ -1397,6 +1415,26 @@ mod tests {
 
         let mut r = BufReader::new(std::io::Cursor::new(raw.as_bytes().to_vec()));
         match read_body(&mut r, &head, 4) {
+            Err(BodyError::TooLarge) => {}
+            _ => panic!("expected TooLarge"),
+        }
+    }
+
+    #[test]
+    fn chunked_size_cannot_overflow_the_limit() {
+        // A first small chunk leaves `out` non-empty, then a chunk size near
+        // usize::MAX. `out.len() + size` used to wrap past the limit and reach a huge
+        // allocation; the size must be rejected before anything is allocated.
+        let huge = format!("{:x}", usize::MAX - 1);
+        let raw = format!("2\r\nAB\r\n{huge}\r\n");
+        let head = Head {
+            method: "POST".into(),
+            target: "/mcp".into(),
+            version: "HTTP/1.1".into(),
+            headers: HashMap::from([("transfer-encoding".to_string(), "chunked".to_string())]),
+        };
+        let mut r = BufReader::new(std::io::Cursor::new(raw.into_bytes()));
+        match read_body(&mut r, &head, 1024) {
             Err(BodyError::TooLarge) => {}
             _ => panic!("expected TooLarge"),
         }

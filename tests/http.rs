@@ -807,6 +807,38 @@ fn a_plain_json_reply_is_used_when_sse_is_not_accepted() {
 }
 
 #[test]
+fn sse_delivers_the_result_when_the_tool_streams_nothing_first() {
+    // The only event is the final reply, pushed together with the stream's `done`
+    // flag. The pump must flush it before closing, never skip it and send an empty
+    // stream. Repeating widens the window for the drain/done race if it returns.
+    let (port, http) = start(base_server(), HttpOptions::default());
+    for _ in 0..50 {
+        let resp = post(
+            port,
+            "/mcp",
+            &[
+                JSON_CT,
+                HDR_VERSION,
+                ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", "echo"),
+                ("Accept", "text/event-stream"),
+            ],
+            &call_body(7, "echo", json!({"arguments": {"text": "hi"}})),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.header("content-type"), "text/event-stream");
+        let stream = sse_body(&resp);
+        let events: Vec<&str> = stream.split("\n\n").filter(|e| !e.is_empty()).collect();
+        assert_eq!(events.len(), 1, "expected exactly the result event: {stream:?}");
+        let data = events[0].strip_prefix("data: ").expect("event shape");
+        let v: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["result"]["content"][0]["text"], "hi");
+    }
+    http.stop();
+}
+
+#[test]
 fn closing_an_sse_stream_cancels_the_tool() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&cancelled);

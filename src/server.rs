@@ -757,12 +757,16 @@ impl Server {
         let empty_obj = json::obj();
         let params = obj.get(FLD_PARAMS).unwrap_or(&empty_obj);
 
-        let pv = args::get(params, FLD_META).and_then(|m| args::get(m, META_PROTOCOL_VERSION));
-        let stateless = matches!(pv, Some(p) if p.is_string());
-        if stateless && id_v.is_some() {
-            let requested = pv.and_then(|p| p.as_str()).unwrap_or_default();
-            if !is_stateless_version(requested) {
-                return self.unsupported_version(id, requested);
+        let pv = args::get(params, FLD_META)
+            .and_then(|m| args::get(m, META_PROTOCOL_VERSION))
+            .and_then(|p| p.as_str());
+        // A per-call revision marks a stateless request only when it names a stateless
+        // version. A supported stateful version here is just a normal stateful request;
+        // only a version in neither family is rejected.
+        let stateless = matches!(pv, Some(v) if is_stateless_version(v));
+        if let Some(v) = pv {
+            if id_v.is_some() && !is_stateless_version(v) && !is_stateful_version(v) {
+                return self.unsupported_version(id, v);
             }
         }
 
