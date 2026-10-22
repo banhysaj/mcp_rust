@@ -7,6 +7,10 @@
 //! before later requests are dispatched and a cancellation takes effect
 //! immediately rather than waiting behind a busy worker.
 //!
+//! The only dependency is `serde_json`, and there is no async runtime: the server
+//! runs on the standard library and a pool of OS threads, so nothing else is
+//! vendored.
+//!
 //! Two transports are included: newline-delimited JSON over stdin/stdout, and
 //! Streamable HTTP with server-sent events for streamed tool calls.
 //!
