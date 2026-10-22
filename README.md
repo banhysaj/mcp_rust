@@ -1,25 +1,35 @@
 # mcp-async
 
+[![CI](https://github.com/banhysaj/mcp_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/banhysaj/mcp_rust/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust 1.74+](https://img.shields.io/badge/rust-1.74%2B-orange.svg)
+![Dependencies: serde_json](https://img.shields.io/badge/dependencies-serde__json-success.svg)
+
+*A dependency-light, multithreaded MCP server library for Rust — stdio and Streamable HTTP, no async runtime.*
+
+> [!NOTE]
+> ✨ No async runtime and a single dependency (`serde_json`) — just `std::net` and a worker thread pool.
+
 An MCP server library for Rust. Tool calls run on a worker thread pool, a running
 request can be cancelled, and the same server can be served over stdio or over
 Streamable HTTP with server-sent events.
 
-- **Worker pool dispatch.** `set_max_threads` sizes the pool; the default is one
+- 🧵 **Worker pool dispatch.** `set_max_threads` sizes the pool; the default is one
   worker per hardware thread.
-- **Cooperative cancellation.** Handlers poll `ctx.cancelled()`, driven by
+- 🛑 **Cooperative cancellation.** Handlers poll `ctx.cancelled()`, driven by
   `notifications/cancelled` on stdio and by a client hang-up on HTTP.
-- **Inline handshake.** `initialize` always completes before later requests are
+- 🤝 **Inline handshake.** `initialize` always completes before later requests are
   dispatched, and a cancellation is never delayed behind a busy worker.
-- **Serialised output.** Replies and notifications from different workers cannot
+- 🔒 **Serialised output.** Replies and notifications from different workers cannot
   interleave.
-- **Both revision families.** Stateless `2026-07-28` and stateful `2025-11-25`,
+- 🗂️ **Both revision families.** Stateless `2026-07-28` and stateful `2025-11-25`,
   `2025-06-18`, `2025-03-26`, `2024-11-05`, with `resultType`, `_meta.serverInfo`
   and cache hints on stateless replies.
-- **Elicitation.** Form and url modes, capability checks, and a defined second run
+- 💬 **Elicitation.** Form and url modes, capability checks, and a defined second run
   that reads the client's answers.
-- **Streamable HTTP.** One POST endpoint, `Origin` checks, pluggable authorization,
+- 🌊 **Streamable HTTP.** One POST endpoint, `Origin` checks, pluggable authorization,
   header/body agreement, and chunked SSE progress for `tools/call`.
-- **Nesting guard.** Messages nested deeper than 128 levels are refused before they
+- 🛡️ **Nesting guard.** Messages nested deeper than 128 levels are refused before they
   reach the parser, on both transports.
 
 The only dependency is [`serde_json`](https://crates.io/crates/serde_json). The HTTP
