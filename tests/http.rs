@@ -829,7 +829,11 @@ fn sse_delivers_the_result_when_the_tool_streams_nothing_first() {
         assert_eq!(resp.header("content-type"), "text/event-stream");
         let stream = sse_body(&resp);
         let events: Vec<&str> = stream.split("\n\n").filter(|e| !e.is_empty()).collect();
-        assert_eq!(events.len(), 1, "expected exactly the result event: {stream:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly the result event: {stream:?}"
+        );
         let data = events[0].strip_prefix("data: ").expect("event shape");
         let v: Value = serde_json::from_str(data).unwrap();
         assert_eq!(v["id"], 7);

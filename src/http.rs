@@ -461,9 +461,8 @@ fn handle_connection(
         // The idle timeout above bounds the wait for a request to begin. A body can
         // legitimately arrive in bursts, so give it a longer inactivity window rather
         // than dropping a slow upload the moment it pauses.
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(
-            opts.read_timeout_seconds.max(30),
-        )));
+        let _ =
+            stream.set_read_timeout(Some(Duration::from_secs(opts.read_timeout_seconds.max(30))));
         let body = match read_body(&mut reader, &head, opts.max_body_bytes) {
             Ok(b) => b,
             Err(BodyError::TooLarge) => {
